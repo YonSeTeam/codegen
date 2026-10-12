@@ -19,6 +19,10 @@ struct Options {
 	QStringList inputPaths;
 	bool isPalette = false;
 
+	// Parse with the sibling X.material.style overrides and the
+	// icons_material/ icon variants applied (not a command line option).
+	bool material = false;
+
 	// --render-svg mode: render SVG to PNG preview.
 	QString renderSvgInput;
 	QString renderSvgOutput;

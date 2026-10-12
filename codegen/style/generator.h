@@ -23,7 +23,14 @@ class Module;
 
 class Generator {
 public:
-	Generator(const structure::Module &module, const QString &destBasePath, const common::ProjectInfo &project, bool isPalette);
+	// The material module is the same file parsed with the Material
+	// overrides and icon variants, it is nullptr for the palette.
+	Generator(
+		const structure::Module &module,
+		const structure::Module *material,
+		const QString &destBasePath,
+		const common::ProjectInfo &project,
+		bool isPalette);
 	Generator(const Generator &other) = delete;
 	Generator &operator=(const Generator &other) = delete;
 
@@ -53,9 +60,17 @@ private:
 	bool writeIconValues();
 	bool writeIconsInit();
 
+	bool writeVariableAssignments();
+
 	bool collectUniqueValues();
+	bool collectMaterialChanges();
+	[[nodiscard]] const structure::Variable *materialVariable(
+		const structure::Variable &variable) const;
+	[[nodiscard]] bool headerValueChanges(
+		const structure::Variable &variable) const;
 
 	const structure::Module &module_;
+	const structure::Module *material_ = nullptr;
 	QString basePath_, baseName_;
 	const common::ProjectInfo &project_;
 	std::unique_ptr<common::CppFile> source_, header_;
@@ -65,6 +80,7 @@ private:
 	QMap<std::string, int> fontFamilies_;
 	QMap<QString, int> iconMasks_; // icon file -> index
 	std::map<QString, int, std::greater<QString>> paletteIndices_;
+	QSet<QString> materialChanges_; // Variables with other Material values.
 
 };
 

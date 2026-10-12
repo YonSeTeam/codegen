@@ -17,9 +17,26 @@ namespace style {
 namespace {
 
 constexpr int kErrorCantWritePath = 821;
+constexpr int kErrorMaterial     = 822;
 
 QString destFileBaseName(const structure::Module &module) {
 	return "style_" + QFileInfo(module.filepath()).baseName();
+}
+
+// Material overrides only change values, so both parses must give
+// the same variables of the same types.
+bool sameVariables(
+		const structure::Module &module,
+		const structure::Module &material) {
+	if (module.variablesCount() != material.variablesCount()) {
+		return false;
+	}
+	return module.enumVariables([&](const structure::Variable &variable) {
+		const auto other = structure::Module::findVariableInModule(
+			variable.name,
+			material);
+		return other && (other->value.type() == variable.value.type());
+	});
 }
 
 } // namespace
@@ -30,6 +47,9 @@ Processor::Processor(const Options &options)
 
 int Processor::launch() {
 	auto cache = std::map<QString, std::shared_ptr<const structure::Module>>();
+	auto materialCache = cache;
+	auto materialOptions = options_;
+	materialOptions.material = true;
 	for (auto i = 0; i != options_.inputPaths.size(); ++i) {
 		auto parser = ParsedFile(cache, options_, i);
 		if (!parser.read()) {
@@ -37,7 +57,22 @@ int Processor::launch() {
 		}
 
 		const auto module = parser.getResult();
-		if (!write(*module)) {
+		auto material = std::unique_ptr<const structure::Module>();
+		if (!options_.isPalette) {
+			auto materialParser = ParsedFile(materialCache, materialOptions, i);
+			if (!materialParser.read()) {
+				common::logError(kErrorMaterial, module->filepath())
+					<< "could not apply Material overrides and icons.";
+				return -1;
+			}
+			material = materialParser.getResult();
+			if (!sameVariables(*module, *material)) {
+				common::logError(kErrorMaterial, module->filepath())
+					<< "Material variables differ from the module ones.";
+				return -1;
+			}
+		}
+		if (!write(*module, material.get())) {
 			return -1;
 		}
 	}
@@ -47,7 +82,9 @@ int Processor::launch() {
 	return 0;
 }
 
-bool Processor::write(const structure::Module &module) const {
+bool Processor::write(
+		const structure::Module &module,
+		const structure::Module *material) const {
 	bool forceReGenerate = false;
 	QDir dir(options_.outputPath);
 	if (!dir.mkpath(".")) {
@@ -64,7 +101,12 @@ bool Processor::write(const structure::Module &module) const {
 		forceReGenerate
 	};
 
-	Generator generator(module, dstFilePath, project, options_.isPalette);
+	Generator generator(
+		module,
+		material,
+		dstFilePath,
+		project,
+		options_.isPalette);
 	if (!generator.writeHeader() || !generator.writeSource()) {
 		return false;
 	}

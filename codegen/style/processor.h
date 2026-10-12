@@ -31,7 +31,9 @@ public:
 	~Processor();
 
 private:
-	bool write(const structure::Module &module) const;
+	bool write(
+		const structure::Module &module,
+		const structure::Module *material) const;
 
 	const Options &options_;
 

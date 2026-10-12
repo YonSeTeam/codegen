@@ -12,6 +12,7 @@
 #include <set>
 #include <memory>
 #include <functional>
+#include <vector>
 #include <QtCore/QDir>
 #include <QtCore/QSet>
 #include <QtCore/QBuffer>
@@ -160,8 +161,14 @@ QString paletteColorValue(const structure::data::color &value) {
 
 } // namespace
 
-Generator::Generator(const structure::Module &module, const QString &destBasePath, const common::ProjectInfo &project, bool isPalette)
+Generator::Generator(
+	const structure::Module &module,
+	const structure::Module *material,
+	const QString &destBasePath,
+	const common::ProjectInfo &project,
+	bool isPalette)
 : module_(module)
+, material_(material)
 , basePath_(destBasePath)
 , baseName_(QFileInfo(basePath_).baseName())
 , project_(project)
@@ -189,6 +196,10 @@ bool Generator::writeHeader() {
 bool Generator::writeSource() {
 	source_ = std::make_unique<common::CppFile>(basePath_ + ".cpp", project_);
 
+	if (module_.hasVariables()
+		&& (!collectUniqueValues() || !collectMaterialChanges())) {
+		return false;
+	}
 	writeIncludesInSource();
 
 	if (module_.hasVariables()) {
@@ -592,7 +603,8 @@ bool Generator::writeRefsDeclarations() {
 			return false;
 		}
 
-		if (IsValueInHeader(value.value.type())) {
+		if (IsValueInHeader(value.value.type())
+			&& !headerValueChanges(value)) {
 			header_->stream()
 				<< "constexpr "
 				<< type
@@ -624,7 +636,8 @@ bool Generator::writeIncludesInSource() {
 		source_->include("ui/style/style_core_palette.h");
 		source_->newline();
 	}
-	if (!module_.hasIncludes()) {
+	const auto material = !materialChanges_.isEmpty();
+	if (!module_.hasIncludes() && !material) {
 		return true;
 	}
 
@@ -638,8 +651,15 @@ bool Generator::writeIncludesInSource() {
 		return true;
 	};
 	auto result = module_.enumIncludes(collector);
+	if (material) {
+		// Material values may refer to modules used only by overrides.
+		material_->enumIncludes(collector);
+	}
 	for (const auto &base : includes) {
 		source_->include("styles/" + base + ".h");
+	}
+	if (material) {
+		source_->include("ui/style/style_core_design.h");
 	}
 	source_->newline();
 	return result;
@@ -665,6 +685,17 @@ bool Generator::writeVariableDefinitions() {
 				<< " = "
 				<< typeToDefaultValue(variable.value.type())
 				<< ";\n";
+		} else if (headerValueChanges(variable)) {
+			// A constant with a Material value becomes a variable. It starts
+			// with the classic value, so code reading it before the styles
+			// are started still gets the value it got as a constant.
+			source_->stream()
+				<< type
+				<< " _"
+				<< name
+				<< " = "
+				<< valueAssignmentCode(variable.value, true)
+				<< ";\n";
 		}
 		return true;
 	});
@@ -686,7 +717,8 @@ bool Generator::writeRefsDefinition() {
 		if (type.isEmpty()) {
 			return false;
 		}
-		if (IsValueInHeader(variable.value.type())) {
+		if (IsValueInHeader(variable.value.type())
+			&& !headerValueChanges(variable)) {
 			return true;
 		}
 		source_->stream() << "const " << type << " &" << name << "(";
@@ -939,9 +971,6 @@ bool Generator::writeVariableInit() {
 		return true;
 	}
 
-	if (!collectUniqueValues()) {
-		return false;
-	}
 	bool hasUniqueValues = (!fontFamilies_.isEmpty() || !iconMasks_.isEmpty());
 	if (hasUniqueValues) {
 		source_->pushNamespace();
@@ -959,21 +988,31 @@ void init_" << baseName_ << "(int scale) {\n\
 	if (inited) return;\n\
 	inited = true;\n\n";
 
-	if (module_.hasIncludes()) {
-		bool writtenAtLeastOne = false;
-		bool result = module_.enumIncludes([&](const Module &module) -> bool {
-			if (module.hasVariables()) {
-				source_->stream() << "\tinit_" + moduleBaseName(module) + "(scale);\n";
-				writtenAtLeastOne = true;
+	auto includedBases = QStringList();
+	auto writtenAtLeastOne = false;
+	const auto writeIncludedInit = [&](const Module &module) {
+		if (module.hasVariables()) {
+			source_->stream() << "\tinit_" + moduleBaseName(module) + "(scale);\n";
+			writtenAtLeastOne = true;
+		}
+	};
+	module_.enumIncludes([&](const Module &module) {
+		includedBases.push_back(moduleBaseName(module));
+		writeIncludedInit(module);
+		return true;
+	});
+	if (!materialChanges_.isEmpty()) {
+		material_->enumIncludes([&](const Module &module) {
+			const auto base = moduleBaseName(module);
+			if (!includedBases.contains(base)) {
+				includedBases.push_back(base);
+				writeIncludedInit(module);
 			}
 			return true;
 		});
-		if (!result) {
-			return false;
-		}
-		if (writtenAtLeastOne) {
-			source_->newline();
-		}
+	}
+	if (writtenAtLeastOne) {
+		source_->newline();
 	}
 
 	if (!pxValues_.isEmpty() || !fontFamilies_.isEmpty()) {
@@ -993,22 +1032,72 @@ void init_" << baseName_ << "(int scale) {\n\
 
 	if (isPalette_) {
 		source_->stream() << "\t_palette.finalize();\n";
-	} else if (!module_.enumVariables([&](const Variable &variable) -> bool {
-		auto name = variable.name.back();
-		auto value = valueAssignmentCode(variable.value);
-		if (value.isEmpty()) {
-			return false;
-		}
-		if (!IsValueInHeader(variable.value.type())) {
-			source_->stream() << "\t_" << name << " = " << value << ";\n";
-		}
-		return true;
-	})) {
+	} else if (!writeVariableAssignments()) {
 		return false;
 	}
 	source_->stream() << "\
 }\n\n";
 	return true;
+}
+
+// Consecutive variables with other Material values are assigned under one
+// condition. The order of all assignments is kept, because later values
+// may refer to earlier ones.
+bool Generator::writeVariableAssignments() {
+	struct Assignment {
+		QString name;
+		QString classic;
+		QString material;
+	};
+	auto changed = std::vector<Assignment>();
+	const auto writeChanged = [&] {
+		if (changed.empty()) {
+			return;
+		}
+		source_->stream() << "\tif (style::IsMaterial()) {\n";
+		for (const auto &assignment : changed) {
+			source_->stream()
+				<< "\t\t_"
+				<< assignment.name
+				<< " = "
+				<< assignment.material
+				<< ";\n";
+		}
+		source_->stream() << "\t} else {\n";
+		for (const auto &assignment : changed) {
+			source_->stream()
+				<< "\t\t_"
+				<< assignment.name
+				<< " = "
+				<< assignment.classic
+				<< ";\n";
+		}
+		source_->stream() << "\t}\n";
+		changed.clear();
+	};
+	const auto result = module_.enumVariables([&](
+			const Variable &variable) -> bool {
+		auto name = variable.name.back();
+		auto value = valueAssignmentCode(variable.value);
+		if (value.isEmpty()) {
+			return false;
+		}
+		const auto inHeader = IsValueInHeader(variable.value.type());
+		if (materialChanges_.contains(name)) {
+			const auto material = materialVariable(variable);
+			changed.push_back({
+				name,
+				inHeader ? valueAssignmentCode(variable.value, true) : value,
+				valueAssignmentCode(material->value, inHeader),
+			});
+		} else if (!inHeader) {
+			writeChanged();
+			source_->stream() << "\t_" << name << " = " << value << ";\n";
+		}
+		return true;
+	});
+	writeChanged();
+	return result;
 }
 
 bool Generator::writeFontFamiliesInit() {
@@ -1296,7 +1385,50 @@ bool Generator::collectUniqueValues() {
 		}
 		return true;
 	};
-	return module_.enumVariables(collector);
+	// Classic values go first, so a module without Material changes
+	// gets the same icon and font indices as without the Material parse.
+	return module_.enumVariables(collector)
+		&& (!material_ || material_->enumVariables(collector));
+}
+
+bool Generator::collectMaterialChanges() {
+	if (!material_) {
+		return true;
+	}
+	return module_.enumVariables([&](const Variable &variable) -> bool {
+		const auto material = materialVariable(variable);
+		if (!material) {
+			return false;
+		}
+		const auto inHeader = IsValueInHeader(variable.value.type());
+		const auto classic = valueAssignmentCode(variable.value, inHeader);
+		const auto changed = valueAssignmentCode(material->value, inHeader);
+		if (classic.isEmpty() || changed.isEmpty()) {
+			return false;
+		} else if (classic != changed) {
+			materialChanges_.insert(variable.name.back());
+		}
+		return true;
+	});
+}
+
+const structure::Variable *Generator::materialVariable(
+		const Variable &variable) const {
+	return material_
+		? Module::findVariableInModule(variable.name, *material_)
+		: nullptr;
+}
+
+// Int and double values are constants in the header, unless their
+// Material value is different.
+bool Generator::headerValueChanges(const Variable &variable) const {
+	if (!IsValueInHeader(variable.value.type())) {
+		return false;
+	}
+	const auto material = materialVariable(variable);
+	return material
+		&& (valueAssignmentCode(variable.value, true)
+			!= valueAssignmentCode(material->value, true));
 }
 
 } // namespace style

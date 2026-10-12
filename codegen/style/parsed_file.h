@@ -6,9 +6,11 @@
 //
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <functional>
+#include <vector>
 #include <QImage>
 #include "codegen/common/basic_tokenized_file.h"
 #include "codegen/style/options.h"
@@ -41,17 +43,17 @@ public:
 
 private:
 	bool failed() const {
-		return failed_ || file_.failed();
+		return failed_ || file_->failed();
 	}
 
 	// Log error to std::cerr with 'code' at the current position in file.
 	common::LogStream logError(int code) {
 		failed_ = true;
-		return file_.logError(code);
+		return file_->logError(code);
 	}
 	common::LogStream logErrorUnexpectedToken() {
 		failed_ = true;
-		return file_.logErrorUnexpectedToken();
+		return file_->logErrorUnexpectedToken();
 	}
 	common::LogStream logErrorTypeMismatch();
 	common::LogStream logAssert(bool assertion) {
@@ -97,6 +99,29 @@ private:
 
 	structure::data::monoicon readMonoIconFields();
 	QString readMonoIconFilename();
+	QString materialIconPath(
+		const QString &root,
+		const QString &relative,
+		const QString &relativeWithModifiers);
+
+	// Material overrides from the sibling X.material.style file.
+	struct Override {
+		structure::FullName path;
+		int position = 0; // First token of the value in overridesFile_.
+		int end = 0; // First token after the value.
+		bool applied = false;
+	};
+	bool readOverrides();
+	bool skipOverrideValue();
+	bool addOverride(Override &&entry);
+	void applyOverrides(structure::Variable &variable);
+	bool applyOverride(structure::Variable &variable, const Override &entry);
+	bool applyFieldOverride(
+		structure::Value &value,
+		const Override &entry,
+		int index);
+	structure::Value readOverrideValue(const Override &entry);
+	void checkOverridesApplied();
 
 	// Read next token and fire unexpected token error if it is not of "type".
 	using BasicToken = common::BasicTokenizedFile::Token;
@@ -111,12 +136,17 @@ private:
 	std::map<QString, std::shared_ptr<const structure::Module>> includeCache_;
 
 	QString filePath_;
-	common::BasicTokenizedFile file_;
+	common::BasicTokenizedFile mainFile_;
+	common::BasicTokenizedFile *file_ = &mainFile_;
 	Options options_;
 	bool failed_ = false;
 	std::unique_ptr<structure::Module> module_;
 
 	std::vector<QString> includeStack_;
+
+	std::unique_ptr<common::BasicTokenizedFile> overridesFile_;
+	std::vector<Override> overrides_;
+	std::map<QString, std::vector<int>> overridesByName_;
 
 	QMap<std::string, structure::Type> typeNames_ = {
 		{ "int"       , { structure::TypeTag::Int } },

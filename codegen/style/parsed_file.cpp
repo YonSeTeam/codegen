@@ -6,6 +6,7 @@
 //
 #include "codegen/style/parsed_file.h"
 
+#include <algorithm>
 #include <iostream>
 #include <QtCore/QMap>
 #include <QtCore/QDir>
@@ -33,6 +34,10 @@ constexpr int kErrorBadString          = 806;
 constexpr int kErrorIconDuplicate      = 807;
 constexpr int kErrorBadIconModifier    = 808;
 constexpr int kErrorCyclicDependency   = 809;
+constexpr int kErrorUnknownOverride    = 810;
+constexpr int kErrorOverrideConflict   = 811;
+constexpr int kErrorBadMaterialIcon    = 812;
+constexpr int kErrorOverridesAsModule  = 813;
 
 QString findInputFile(const Options &options, int index) {
 	for (const auto &dir : options.includePaths) {
@@ -122,6 +127,35 @@ bool validateAlignString(const QString &value) {
 	return RegExp.match(value).hasMatch();
 }
 
+[[nodiscard]] bool IsMaterialOverridesPath(const QString &path) {
+	return path.endsWith(".material.style");
+}
+
+[[nodiscard]] QString MaterialOverridesPath(const QString &path) {
+	const auto suffix = QString(".style");
+	return (path.endsWith(suffix) && !IsMaterialOverridesPath(path))
+		? (path.chopped(suffix.size()) + ".material.style")
+		: QString();
+}
+
+// A copy of a struct value that can be changed without changing the values
+// it shares data with. If the value is a copy of a named struct, its fields
+// become copies of that struct's fields, so the generated code keeps
+// referring to them instead of duplicating their values.
+[[nodiscard]] structure::Value WritableStruct(const structure::Value &value) {
+	auto fields = *value.Fields();
+	const auto &copyOf = value.copyOf();
+	if (!copyOf.isEmpty()) {
+		for (auto &field : fields) {
+			auto &fieldValue = field.variable.value;
+			if (fieldValue.copyOf().isEmpty()) {
+				fieldValue = fieldValue.makeCopy(copyOf + field.variable.name);
+			}
+		}
+	}
+	return { value.type().name, fields };
+}
+
 } // namespace
 
 Modifier GetModifier(const QString &name) {
@@ -167,7 +201,7 @@ ParsedFile::ParsedFile(
 	std::vector<QString> includeStack)
 : includeCache_(includeCache)
 , filePath_(findInputFile(options, index))
-, file_(filePath_)
+, mainFile_(filePath_)
 , options_(options)
 , includeStack_(includeStack) {
 }
@@ -177,20 +211,28 @@ bool ParsedFile::read() {
 		!= end(includeStack_)) {
 		logError(kErrorCyclicDependency) << "include cycle detected.";
 		return false;
-	} else if (!file_.read()) {
+	} else if (IsMaterialOverridesPath(filePath_)) {
+		logError(kErrorOverridesAsModule)
+			<< "Material overrides can't be used as a module.";
+		return false;
+	} else if (!file_->read()) {
 		return false;
 	}
 
 	auto absolutePath = QFileInfo(filePath_).absoluteFilePath();
 	module_ = std::make_unique<structure::Module>(absolutePath);
+	if (options_.material && !options_.isPalette && !readOverrides()) {
+		module_ = nullptr;
+		return false;
+	}
 	do {
-		if (auto startToken = file_.getToken(BasicType::Name)) {
+		if (auto startToken = file_->getToken(BasicType::Name)) {
 			if (tokenValue(startToken) == "using") {
 				if (auto includedResult = readIncluded()) {
 					module_->addIncluded(std::move(includedResult));
 					continue;
 				}
-			} else if (auto braceOpen = file_.getToken(BasicType::LeftBrace)) {
+			} else if (auto braceOpen = file_->getToken(BasicType::LeftBrace)) {
 				if (auto structResult = readStruct(tokenValue(startToken))) {
 					if (module_->addStruct(structResult)) {
 						continue;
@@ -198,8 +240,11 @@ bool ParsedFile::read() {
 					logError(kErrorAlreadyDefined) << "struct '" << logFullName(structResult.name) << "' already defined";
 					break;
 				}
-			} else if (auto colonToken = file_.getToken(BasicType::Colon)) {
+			} else if (auto colonToken = file_->getToken(BasicType::Colon)) {
 				if (auto variableResult = readVariable(tokenValue(startToken))) {
+					if (!overrides_.empty() && !failed()) {
+						applyOverrides(variableResult);
+					}
 					if (module_->addVariable(variableResult)) {
 						continue;
 					}
@@ -208,16 +253,259 @@ bool ParsedFile::read() {
 				}
 			}
 		}
-		if (file_.atEnd()) {
+		if (file_->atEnd()) {
 			break;
 		}
 		logErrorUnexpectedToken() << "using keyword, or struct definition, or variable definition";
 	} while (!failed());
 
+	if (!failed() && !overrides_.empty()) {
+		checkOverridesApplied();
+	}
 	if (failed()) {
 		module_ = nullptr;
 	}
 	return !failed();
+}
+
+bool ParsedFile::readOverrides() {
+	const auto path = MaterialOverridesPath(filePath_);
+	if (path.isEmpty() || !QFileInfo::exists(path)) {
+		return true;
+	}
+	overridesFile_ = std::make_unique<common::BasicTokenizedFile>(path);
+	if (!overridesFile_->read()) {
+		failed_ = true;
+		return false;
+	}
+	file_ = overridesFile_.get();
+	do {
+		if (auto startToken = file_->getToken(BasicType::Name)) {
+			if (tokenValue(startToken) == "using") {
+				if (auto includedResult = readIncluded()) {
+					module_->addIncluded(std::move(includedResult));
+					continue;
+				}
+				break;
+			}
+			auto entry = Override{ { tokenValue(startToken) } };
+			while (!failed() && file_->getToken(BasicType::Dot)) {
+				if (const auto fieldName = assertNextToken(BasicType::Name)) {
+					entry.path.push_back(tokenValue(fieldName));
+				}
+			}
+			if (!failed() && assertNextToken(BasicType::Colon)) {
+				entry.position = file_->position();
+				if (skipOverrideValue()) {
+					entry.end = file_->position();
+					if (addOverride(std::move(entry))) {
+						continue;
+					}
+				}
+			}
+			break;
+		}
+		if (file_->atEnd()) {
+			break;
+		}
+		logErrorUnexpectedToken() << "using keyword or a Material override";
+	} while (!failed());
+
+	if (file_->failed()) {
+		failed_ = true;
+	}
+	file_ = &mainFile_;
+	return !failed_;
+}
+
+// Values are parsed where the overridden variable is defined, this only
+// finds where each of them ends: at ';' or at the '}' closing a struct.
+bool ParsedFile::skipOverrideValue() {
+	auto depth = 0;
+	while (true) {
+		const auto token = file_->getAnyToken();
+		switch (token.type) {
+		case BasicType::Invalid:
+			logErrorUnexpectedToken() << "Material override value and ';'";
+			return false;
+		case BasicType::LeftParenthesis:
+		case BasicType::LeftBrace:
+		case BasicType::LeftBracket:
+			++depth;
+			break;
+		case BasicType::RightParenthesis:
+		case BasicType::RightBrace:
+		case BasicType::RightBracket:
+			if (--depth < 0) {
+				file_->putBack();
+				logErrorUnexpectedToken() << "Material override value";
+				return false;
+			} else if (!depth && token.type == BasicType::RightBrace) {
+				file_->getToken(BasicType::Semicolon);
+				return true;
+			}
+			break;
+		case BasicType::Semicolon:
+			if (!depth) {
+				return true;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+bool ParsedFile::addOverride(Override &&entry) {
+	auto &indices = overridesByName_[entry.path.front()];
+	for (const auto index : indices) {
+		const auto &already = overrides_[index].path;
+		const auto length = std::min(already.size(), entry.path.size());
+		if (already.mid(0, length) == entry.path.mid(0, length)) {
+			logError(kErrorOverrideConflict)
+				<< "Material override '"
+				<< logFullName(entry.path)
+				<< "' conflicts with '"
+				<< logFullName(already)
+				<< "'";
+			return false;
+		}
+	}
+	indices.push_back(int(overrides_.size()));
+	overrides_.push_back(std::move(entry));
+	return true;
+}
+
+void ParsedFile::applyOverrides(structure::Variable &variable) {
+	const auto i = overridesByName_.find(variable.name.front());
+	if (i == overridesByName_.end()) {
+		return;
+	}
+	for (const auto index : i->second) {
+		auto &entry = overrides_[index];
+		entry.applied = true;
+		if (!applyOverride(variable, entry)) {
+			return;
+		}
+	}
+}
+
+bool ParsedFile::applyOverride(
+		structure::Variable &variable,
+		const Override &entry) {
+	file_ = overridesFile_.get();
+	file_->setPosition(entry.position);
+	auto result = false;
+	if (entry.path.size() > 1) {
+		result = applyFieldOverride(variable.value, entry, 1);
+	} else if (auto value = readOverrideValue(entry)) {
+		if (value.type() != variable.value.type()) {
+			file_->setPosition(entry.position);
+			logErrorTypeMismatch()
+				<< "variable '"
+				<< logFullName(entry.path)
+				<< "' has type '"
+				<< logType(variable.value.type())
+				<< "' while the Material value has type '"
+				<< logType(value.type())
+				<< "'";
+		} else {
+			variable.value = value;
+			result = true;
+		}
+	}
+	if (file_->failed()) {
+		failed_ = true;
+	}
+	file_ = &mainFile_;
+	return result && !failed_;
+}
+
+bool ParsedFile::applyFieldOverride(
+		structure::Value &value,
+		const Override &entry,
+		int index) {
+	if (value.type().tag != structure::TypeTag::Struct || !value.Fields()) {
+		logError(kErrorUnknownField)
+			<< "'"
+			<< logFullName(entry.path.mid(0, index))
+			<< "' is not a struct, so it has no field '"
+			<< entry.path[index].toStdString()
+			<< "'";
+		return false;
+	}
+	auto result = WritableStruct(value);
+	const auto name = structure::FullName{ entry.path[index] };
+	for (auto &field : *result.Fields()) {
+		if (field.variable.name != name) {
+			continue;
+		}
+		auto &fieldValue = field.variable.value;
+		if (index + 1 < entry.path.size()) {
+			if (!applyFieldOverride(fieldValue, entry, index + 1)) {
+				return false;
+			}
+		} else if (auto replacement = readOverrideValue(entry)) {
+			if (replacement.type() != fieldValue.type()) {
+				file_->setPosition(entry.position);
+				logErrorTypeMismatch()
+					<< "field '"
+					<< logFullName(entry.path)
+					<< "' has type '"
+					<< logType(fieldValue.type())
+					<< "' while the Material value has type '"
+					<< logType(replacement.type())
+					<< "'";
+				return false;
+			}
+			fieldValue = replacement;
+		} else {
+			return false;
+		}
+		field.status = structure::data::field::Status::Explicit;
+		value = result;
+		return true;
+	}
+	logError(kErrorUnknownField)
+		<< "field '"
+		<< entry.path[index].toStdString()
+		<< "' was not found in struct of type '"
+		<< logType(value.type())
+		<< "'";
+	return false;
+}
+
+structure::Value ParsedFile::readOverrideValue(const Override &entry) {
+	auto result = readValue();
+	if (!result || failed()) {
+		return {};
+	} else if (result.type().tag != structure::TypeTag::Struct
+		|| !result.copyOf().isEmpty()) {
+		if (!assertNextToken(BasicType::Semicolon)) {
+			return {};
+		}
+	}
+	if (file_->position() != entry.end) {
+		logErrorUnexpectedToken() << "end of the Material override";
+		return {};
+	}
+	return result;
+}
+
+void ParsedFile::checkOverridesApplied() {
+	file_ = overridesFile_.get();
+	for (const auto &entry : overrides_) {
+		if (!entry.applied) {
+			file_->setPosition(entry.position);
+			logError(kErrorUnknownOverride)
+				<< "'"
+				<< entry.path.front().toStdString()
+				<< "' is not a variable of '"
+				<< QFileInfo(filePath_).fileName().toStdString()
+				<< "', so it can't have a Material override";
+		}
+	}
+	file_ = &mainFile_;
 }
 
 common::LogStream ParsedFile::logErrorTypeMismatch() {
@@ -260,7 +548,7 @@ structure::Struct ParsedFile::readStruct(const QString &name) {
 
 	structure::Struct result = { composeFullName(name) };
 	do {
-		if (auto fieldName = file_.getToken(BasicType::Name)) {
+		if (auto fieldName = file_->getToken(BasicType::Name)) {
 			if (auto field = readStructField(tokenValue(fieldName))) {
 				result.fields.push_back(field);
 			}
@@ -284,7 +572,7 @@ structure::Variable ParsedFile::readVariable(const QString &name) {
 		}
 		if (value.type().tag != structure::TypeTag::Struct || !value.copyOf().empty()) {
 			assertNextToken(BasicType::Semicolon);
-			result.description = file_.getCurrentLineComment();
+			result.description = file_->getCurrentLineComment();
 		}
 	}
 	return result;
@@ -352,9 +640,9 @@ structure::Value ParsedFile::readValue() {
 }
 
 structure::Value ParsedFile::readStructValue() {
-	if (auto structName = file_.getToken(BasicType::Name)) {
+	if (auto structName = file_->getToken(BasicType::Name)) {
 		if (auto result = defaultConstructedStruct(composeFullName(tokenValue(structName)))) {
-			if (file_.getToken(BasicType::LeftParenthesis)) {
+			if (file_->getToken(BasicType::LeftParenthesis)) {
 				if (!readStructParents(result)) {
 					return {};
 				}
@@ -364,7 +652,7 @@ structure::Value ParsedFile::readStructValue() {
 			}
 			return result;
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
@@ -455,7 +743,7 @@ bool ParsedFile::checkNoImplicitUnnamedIcons(const structure::Value &value) {
 
 bool ParsedFile::readStructValueInner(structure::Value &result) {
 	do {
-		if (auto fieldName = file_.getToken(BasicType::Name)) {
+		if (auto fieldName = file_->getToken(BasicType::Name)) {
 			if (!assertNextToken(BasicType::Colon)) {
 				return false;
 			}
@@ -498,7 +786,7 @@ bool ParsedFile::readStructParents(structure::Value &result) {
 	do {
 		if (auto parentName = assertNextToken(BasicType::Name)) {
 			applyStructParent(result, composeFullName(tokenValue(parentName)));
-			if (file_.getToken(BasicType::RightParenthesis)) {
+			if (file_->getToken(BasicType::RightParenthesis)) {
 				return true;
 			} else {
 				assertNextToken(BasicType::Comma);
@@ -511,7 +799,7 @@ bool ParsedFile::readStructParents(structure::Value &result) {
 }
 
 structure::Value ParsedFile::readPositiveValue() {
-	auto numericToken = file_.getAnyToken();
+	auto numericToken = file_->getAnyToken();
 	if (numericToken.type == BasicType::Int) {
 		return { structure::TypeTag::Int, tokenValue(numericToken).toInt() };
 	} else if (numericToken.type == BasicType::Double) {
@@ -524,7 +812,7 @@ structure::Value ParsedFile::readPositiveValue() {
 			return { structure::TypeTag::Pixels, base::StringViewMid(value, 0, value.size() - 2).toInt() };
 		}
 	}
-	file_.putBack();
+	file_->putBack();
 	return {};
 }
 
@@ -539,7 +827,7 @@ structure::Value ParsedFile::readNumericValue() {
 				|| type == structure::TypeTag::Pixels) {
 				return copy;
 			} else {
-				file_.putBack();
+				file_->putBack();
 			}
 		}
 		return {};
@@ -586,13 +874,13 @@ structure::Value ParsedFile::readNumericValue() {
 			return false;
 		};
 		while (true) {
-			if (file_.getToken(BasicType::Plus)) {
+			if (file_->getToken(BasicType::Plus)) {
 				if (!applyArithmetic(
 						[](auto a, auto b) { return a + b; },
 						"add")) {
 					return {};
 				}
-			} else if (file_.getToken(BasicType::Minus)) {
+			} else if (file_->getToken(BasicType::Minus)) {
 				if (!applyArithmetic(
 						[](auto a, auto b) { return a - b; },
 						"subtract")) {
@@ -603,7 +891,7 @@ structure::Value ParsedFile::readNumericValue() {
 			}
 		}
 		return value;
-	} else if (auto minusToken = file_.getToken(BasicType::Minus)) {
+	} else if (auto minusToken = file_->getToken(BasicType::Minus)) {
 		if (auto positiveValue = readNumericValue()) {
 			return { positiveValue.type().tag, -positiveValue.Int() };
 		}
@@ -613,7 +901,7 @@ structure::Value ParsedFile::readNumericValue() {
 }
 
 structure::Value ParsedFile::readStringValue() {
-	if (auto stringToken = file_.getToken(BasicType::String)) {
+	if (auto stringToken = file_->getToken(BasicType::String)) {
 		auto value = tokenValue(stringToken);
 		if (validateAnsiString(value)) {
 			return { structure::TypeTag::String, stringToken.value.toStdString() };
@@ -624,15 +912,15 @@ structure::Value ParsedFile::readStringValue() {
 }
 
 structure::Value ParsedFile::readColorValue() {
-	if (auto numberSign = file_.getToken(BasicType::Number)) {
+	if (auto numberSign = file_->getToken(BasicType::Number)) {
 		if (options_.isPalette) {
-			auto color = file_.getAnyToken();
+			auto color = file_->getAnyToken();
 			if (color.type == BasicType::Int || color.type == BasicType::Name) {
 				auto chars = tokenValue(color).toLower();
 				if (isValidColor(chars)) {
-					if (auto fallbackSeparator = file_.getToken(BasicType::Or)) {
+					if (auto fallbackSeparator = file_->getToken(BasicType::Or)) {
 						if (options_.isPalette) {
-							if (auto fallbackName = file_.getToken(BasicType::Name)) {
+							if (auto fallbackName = file_->getToken(BasicType::Name)) {
 								structure::FullName name = { tokenValue(fallbackName) };
 								if (module_->findVariableInModule(name, *module_)) {
 									return { convertWebColor(chars, tokenValue(fallbackName)) };
@@ -655,18 +943,18 @@ structure::Value ParsedFile::readColorValue() {
 		} else {
 			logErrorUnexpectedToken() << "color value alias, unique color values are only allowed in palette module";
 		}
-	} else if (auto transparentName = file_.getToken(BasicType::Name)) {
+	} else if (auto transparentName = file_->getToken(BasicType::Name)) {
 		if (tokenValue(transparentName) == "transparent") {
 			return { structure::data::color { 255, 255, 255, 0 } };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 
 	return {};
 }
 
 structure::Value ParsedFile::readPointValue() {
-	if (auto name = file_.getToken(BasicType::Name)) {
+	if (auto name = file_->getToken(BasicType::Name)) {
 		if (tokenValue(name) == "point") {
 			assertNextToken(BasicType::LeftParenthesis);
 
@@ -681,13 +969,13 @@ structure::Value ParsedFile::readPointValue() {
 
 			return { structure::data::point { x.Int(), y.Int() } };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readSizeValue() {
-	if (auto name = file_.getToken(BasicType::Name)) {
+	if (auto name = file_->getToken(BasicType::Name)) {
 		if (tokenValue(name) == "size") {
 			assertNextToken(BasicType::LeftParenthesis);
 
@@ -702,25 +990,25 @@ structure::Value ParsedFile::readSizeValue() {
 
 			return { structure::data::size { w.Int(), h.Int() } };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readBoolValue() {
-	if (auto value = file_.getToken(BasicType::Name)) {
+	if (auto value = file_->getToken(BasicType::Name)) {
 		if (tokenValue(value) == "true") {
 			return { structure::TypeTag::Bool, true };
 		} else if (tokenValue(value) == "false") {
 			return { structure::TypeTag::Bool, false };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readAlignValue() {
-	if (auto name = file_.getToken(BasicType::Name)) {
+	if (auto name = file_->getToken(BasicType::Name)) {
 		if (tokenValue(name) == "align") {
 			assertNextToken(BasicType::LeftParenthesis);
 
@@ -734,13 +1022,13 @@ structure::Value ParsedFile::readAlignValue() {
 				logError(kErrorBadString) << "bad align string";
 			}
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readMarginsValue() {
-	if (auto name = file_.getToken(BasicType::Name)) {
+	if (auto name = file_->getToken(BasicType::Name)) {
 		if (tokenValue(name) == "margins") {
 			assertNextToken(BasicType::LeftParenthesis);
 
@@ -759,20 +1047,20 @@ structure::Value ParsedFile::readMarginsValue() {
 
 			return { structure::data::margins { l.Int(), t.Int(), r.Int(), b.Int() } };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readFontValue() {
-	if (auto name = file_.getToken(BasicType::Name)) {
+	if (auto name = file_->getToken(BasicType::Name)) {
 		if (tokenValue(name) == "font") {
 			assertNextToken(BasicType::LeftParenthesis);
 
 			int flags = 0;
 			structure::Value family, size;
 			do {
-				if (auto formatToken = file_.getToken(BasicType::Name)) {
+				if (auto formatToken = file_->getToken(BasicType::Name)) {
 					if (tokenValue(formatToken) == "bold"
 						|| tokenValue(formatToken) == "semibold") {
 						flags |= structure::data::font::Bold;
@@ -784,14 +1072,14 @@ structure::Value ParsedFile::readFontValue() {
 						flags |= structure::data::font::Underline;
 						continue;
 					} else {
-						file_.putBack();
+						file_->putBack();
 					}
 				}
 				if (auto familyValue = readStringOrStringCopyValue()) {
 					family = familyValue;
 				} else if (auto sizeValue = readNumericOrNumericCopyValue()) {
 					size = sizeValue;
-				} else if (file_.getToken(BasicType::RightParenthesis)) {
+				} else if (file_->getToken(BasicType::RightParenthesis)) {
 					break;
 				} else {
 					logErrorUnexpectedToken() << "font family, font size or ')'";
@@ -803,24 +1091,24 @@ structure::Value ParsedFile::readFontValue() {
 			}
 			return { structure::data::font { family.String(), size.Int(), flags } };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readIconValue() {
-	if (auto name = file_.getToken(BasicType::Name)) {
+	if (auto name = file_->getToken(BasicType::Name)) {
 		if (tokenValue(name) == "icon") {
 			std::vector<structure::data::monoicon> parts;
-			if (file_.getToken(BasicType::LeftBrace)) { // complex icon
+			if (file_->getToken(BasicType::LeftBrace)) { // complex icon
 				do {
-					if (file_.getToken(BasicType::RightBrace)) {
+					if (file_->getToken(BasicType::RightBrace)) {
 						break;
-					} else if (file_.getToken(BasicType::LeftBrace)) {
+					} else if (file_->getToken(BasicType::LeftBrace)) {
 						if (auto part = readMonoIconFields()) {
 							assertNextToken(BasicType::RightBrace);
 							parts.push_back(part);
-							file_.getToken(BasicType::Comma);
+							file_->getToken(BasicType::Comma);
 							continue;
 						}
 						return {};
@@ -830,7 +1118,7 @@ structure::Value ParsedFile::readIconValue() {
 					}
 				} while (true);
 
-			} else if (file_.getToken(BasicType::LeftParenthesis)) { // short icon
+			} else if (file_->getToken(BasicType::LeftParenthesis)) { // short icon
 				if (auto theOnlyPart = readMonoIconFields()) {
 					assertNextToken(BasicType::RightParenthesis);
 					parts.push_back(theOnlyPart);
@@ -839,19 +1127,19 @@ structure::Value ParsedFile::readIconValue() {
 
 			return { structure::data::icon { parts } };
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
 
 structure::Value ParsedFile::readCopyValue() {
-	if (auto copyName = file_.getToken(BasicType::Name)) {
+	if (auto copyName = file_->getToken(BasicType::Name)) {
 		structure::FullName name = { tokenValue(copyName) };
 		if (auto variable = module_->findVariable(name)) {
 			auto result = variable->value;
 			auto copyOf = variable->name;
-			while (file_.getToken(BasicType::Dot)) {
-				if (auto fieldName = file_.getToken(BasicType::Name)) {
+			while (file_->getToken(BasicType::Dot)) {
+				if (auto fieldName = file_->getToken(BasicType::Name)) {
 					auto fieldNameStr = tokenValue(fieldName);
 					if (result.type().tag == structure::TypeTag::Size) {
 						if (fieldNameStr == "width") {
@@ -918,7 +1206,7 @@ structure::Value ParsedFile::readCopyValue() {
 			}
 			return result.makeCopy(copyOf);
 		}
-		file_.putBack();
+		file_->putBack();
 	}
 	return {};
 }
@@ -933,7 +1221,7 @@ structure::Value ParsedFile::readNumericOrNumericCopyValue() {
 			|| type == structure::TypeTag::Pixels) {
 			return copy;
 		} else {
-			file_.putBack();
+			file_->putBack();
 		}
 	}
 	return {};
@@ -947,7 +1235,7 @@ structure::Value ParsedFile::readStringOrStringCopyValue() {
 		if (type == structure::TypeTag::String) {
 			return copy;
 		} else {
-			file_.putBack();
+			file_->putBack();
 		}
 	}
 	return {};
@@ -956,11 +1244,11 @@ structure::Value ParsedFile::readStringOrStringCopyValue() {
 structure::data::monoicon ParsedFile::readMonoIconFields() {
 	structure::data::monoicon result;
 	result.filename = readMonoIconFilename();
-	if (!result.filename.isEmpty() && file_.getToken(BasicType::Comma)) {
+	if (!result.filename.isEmpty() && file_->getToken(BasicType::Comma)) {
 		if (auto color = readValue()) {
 			if (color.type().tag == structure::TypeTag::Color) {
 				result.color = color;
-				if (file_.getToken(BasicType::Comma)) {
+				if (file_->getToken(BasicType::Comma)) {
 					if (auto padding = readValue()) {
 						if (padding.type().tag == structure::TypeTag::Margins) {
 							result.padding = padding;
@@ -1000,10 +1288,20 @@ QString ParsedFile::readMonoIconFilename() {
 					return QString();
 				}
 			}
+			const auto iconsFolder = QString("icons/");
 			for (auto &path : options_.includePaths) {
 				QFileInfo png(path + '/' + filepath + ".png");
 				QFileInfo svg(path + '/' + filepath + ".svg");
 				if (png.exists() || svg.exists()) {
+					if (options_.material && filepath.startsWith(iconsFolder)) {
+						const auto material = materialIconPath(
+							path,
+							filepath.mid(iconsFolder.size()),
+							fullpath.mid(iconsFolder.size()));
+						if (!material.isEmpty()) {
+							return material;
+						}
+					}
 					return path + '/' + fullpath;
 				}
 			}
@@ -1011,6 +1309,15 @@ QString ParsedFile::readMonoIconFilename() {
 				QFileInfo png(path + "/icons/" + filepath + ".png");
 				QFileInfo svg(path + "/icons/" + filepath + ".svg");
 				if (png.exists() || svg.exists()) {
+					if (options_.material) {
+						const auto material = materialIconPath(
+							path,
+							filepath,
+							fullpath);
+						if (!material.isEmpty()) {
+							return material;
+						}
+					}
 					return path + "/icons/" + fullpath;
 				}
 			}
@@ -1023,8 +1330,33 @@ QString ParsedFile::readMonoIconFilename() {
 	return QString();
 }
 
+// The variant of <root>/icons/<relative> is <root>/icons_material/<relative>,
+// read with the same modifiers. Empty result means there is no variant.
+QString ParsedFile::materialIconPath(
+		const QString &root,
+		const QString &relative,
+		const QString &relativeWithModifiers) {
+	const auto folder = root + "/icons_material/";
+	const auto base = folder + relative;
+	if (QFileInfo::exists(base + ".svg")) {
+		return folder + relativeWithModifiers;
+	}
+	const auto png1x = QFileInfo::exists(base + ".png");
+	const auto png2x = QFileInfo::exists(base + "@2x.png");
+	const auto png3x = QFileInfo::exists(base + "@3x.png");
+	if (png1x && png2x && png3x) {
+		return folder + relativeWithModifiers;
+	} else if (png1x || png2x || png3x) {
+		logError(kErrorBadMaterialIcon)
+			<< "Material icon '"
+			<< base.toStdString()
+			<< "' needs all of .png, @2x.png and @3x.png";
+	}
+	return QString();
+}
+
 BasicToken ParsedFile::assertNextToken(BasicToken::Type type) {
-	auto result = file_.getToken(type);
+	auto result = file_->getToken(type);
 	if (!result) {
 		logErrorUnexpectedToken() << type;
 	}
