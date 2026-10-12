@@ -56,6 +56,7 @@ public:
 		QString value;
 		ConstUtf8String original;
 		bool hasLeftWhitespace;
+		int line;
 
 		explicit operator bool() const {
 			return (type != Type::Invalid);
@@ -76,6 +77,17 @@ public:
 	Token getAnyToken();
 	Token getToken(Token::Type typeCondition);
 	bool putBack();
+
+	// Index of the next token, to return to it later with setPosition().
+	int position() const {
+		return currentToken_;
+	}
+
+	// Returns to a token that was already read. After that errors are
+	// reported at the line of the next token instead of the line where
+	// the reading stopped.
+	void setPosition(int position);
+
 	bool failed() const {
 		return failed_;
 	}
@@ -111,11 +123,14 @@ private:
 	Type saveToken(Type type, const QString &value = QString());
 	Type uniteLastTokens(Type type);
 
+	int errorLine() const;
+
 	CleanFileReader reader_;
 	QList<Token> tokens_;
 	int currentToken_ = 0;
 	int lineNumber_ = 1;
 	bool failed_ = false;
+	bool rewound_ = false;
 	QVector<QByteArray> singleLineComments_;
 
 	// Where the last (currently read) token has started.

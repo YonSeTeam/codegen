@@ -10,6 +10,8 @@
 #include "codegen/common/clean_file_reader.h"
 #include "codegen/common/checked_utf8_string.h"
 
+#include <algorithm>
+
 using Token = codegen::common::BasicTokenizedFile::Token;
 using Type = Token::Type;
 
@@ -35,7 +37,7 @@ bool isWhitespaceChar(char ch) {
 }
 
 Token invalidToken() {
-	return { Type::Invalid, QString(), ConstUtf8String(nullptr, 0), false };
+	return { Type::Invalid, QString(), ConstUtf8String(nullptr, 0), false, 0 };
 }
 
 } // namespace
@@ -52,6 +54,11 @@ bool BasicTokenizedFile::putBack() {
 		return true;
 	}
 	return false;
+}
+
+void BasicTokenizedFile::setPosition(int position) {
+	currentToken_ = std::clamp(position, 0, int(tokens_.size()));
+	rewound_ = true;
 }
 
 Token BasicTokenizedFile::getAnyToken() {
@@ -116,7 +123,13 @@ Type BasicTokenizedFile::readOneToken(StartWithWhitespace condition) {
 
 Type BasicTokenizedFile::saveToken(Type type, const QString &value) {
 	ConstUtf8String original = { tokenStart_, reader_.currentPtr() };
-	tokens_.push_back({ type, value, original, tokenStartWhitespace_ });
+	tokens_.push_back({
+		type,
+		value,
+		original,
+		tokenStartWhitespace_,
+		lineNumber_,
+	});
 	return type;
 }
 
@@ -281,8 +294,14 @@ LogStream operator<<(LogStream &&stream, BasicTokenizedFile::Token::Type type) {
 	return std::forward<LogStream>(stream) << value;
 }
 
+int BasicTokenizedFile::errorLine() const {
+	return (rewound_ && currentToken_ < tokens_.size())
+		? tokens_.at(currentToken_).line
+		: lineNumber_;
+}
+
 LogStream BasicTokenizedFile::logError(int code) const {
-	return reader_.logError(code, lineNumber_);
+	return reader_.logError(code, errorLine());
 }
 
 LogStream BasicTokenizedFile::logErrorUnexpectedToken() const {
