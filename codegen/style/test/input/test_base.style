@@ -1,0 +1,33 @@
+// A module with Material overrides in test_base.material.style.
+
+using "colors.palette";
+
+TestButton {
+	width: pixels;
+	height: pixels;
+	padding: margins;
+	radius: pixels;
+	duration: int;
+	textFg: color;
+	icon: icon;
+}
+
+testRadius: 6px;
+testDuration: 200;
+testRatio: 0.5;
+testPadding: margins(11px, 8px, 11px, 8px);
+testArrow: icon {{ "test/arrow", windowFg }};
+testClose: icon {{ "test/close", windowFg }};
+testButton: TestButton {
+	width: 100px;
+	height: 40px;
+	padding: margins(10px, 5px, 10px, 5px);
+	radius: testRadius;
+	duration: 150;
+	textFg: windowFg;
+	icon: testArrow;
+}
+testButtonBig: TestButton(testButton) {
+	height: 48px;
+}
+testButtonCopy: testButton;

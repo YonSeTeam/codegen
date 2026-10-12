@@ -1,0 +1,12 @@
+// Icons with and without Material variants in icons_material.
+
+using "colors.palette";
+
+testPngArrow: icon {{ "test/png_arrow", windowFg }};
+testPngArrowFlipped: icon {{ "test/png_arrow-flip_horizontal", windowFg }};
+testPngPlain: icon {{ "test/png_plain", windowFg }};
+testPngShadowed: icon {
+	{ "test/png_shadow", windowFg },
+	{ "test/png_arrow", windowFgActive, point(1px, 1px) },
+};
+testSvgSized: icon {{ "test/arrow-12x12", windowFg }};

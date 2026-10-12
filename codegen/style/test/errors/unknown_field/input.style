@@ -1,0 +1,7 @@
+ErrorBox {
+	skip: pixels;
+}
+
+errorBox: ErrorBox {
+	skip: 1px;
+}

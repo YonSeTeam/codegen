@@ -1,0 +1,17 @@
+// A module that Material does not change: generated as upstream does.
+
+using "colors.palette";
+
+TestPlainBox {
+	margin: margins;
+	fg: color;
+}
+
+testPlainSkip: 4px;
+testPlainCount: 3;
+testPlainFont: font(13px semibold);
+testPlainCheck: icon {{ "test/close", windowFg }};
+testPlainBox: TestPlainBox {
+	margin: margins(1px, 2px, 3px, 4px);
+	fg: windowBg;
+}

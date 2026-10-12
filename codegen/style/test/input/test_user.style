@@ -1,0 +1,12 @@
+// A module without overrides that takes values from test_base.style.
+
+using "test_base.style";
+
+testUserPadding: testPadding;
+testUserSkip: testPadding.left;
+testUserGap: testRadius + 2px;
+testUserDuration: testDuration;
+testUserButton: TestButton(testButtonBig) {
+	width: 120px;
+}
+testUserSize: size(20px, 20px);

@@ -1,0 +1,4 @@
+errorBox.skip: 2px;
+errorBox: ErrorBox {
+	skip: 3px;
+}

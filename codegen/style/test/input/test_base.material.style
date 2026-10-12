@@ -1,0 +1,8 @@
+// Material values of test_base.style.
+
+testRadius: 10px;
+testDuration: 250;
+testPadding: margins(13px, 7px, 13px, 8px);
+testButton.padding: margins(12px, 6px, 12px, 6px);
+testButton.textFg: windowBgActive;
+testButtonCopy.duration: 200;

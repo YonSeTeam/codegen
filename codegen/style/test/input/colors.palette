@@ -1,0 +1,6 @@
+// Palette of the Material self-test.
+
+windowBg: #ffffff; // Window background
+windowFg: #000000; // Window text
+windowBgActive: #40a7e3; // Accent background
+windowFgActive: #ffffff; // Accent text
