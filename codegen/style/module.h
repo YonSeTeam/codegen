@@ -20,6 +20,8 @@ class Module {
 public:
 
 	explicit Module(const QString &fullpath);
+	Module(const Module &other) = delete;
+	Module &operator=(const Module &other) = delete;
 
 	QString filepath() const {
 		return fullpath_;
@@ -87,8 +89,15 @@ public:
 	static const Variable *findVariableInModule(const FullName &name, const Module &module);
 
 private:
+	// This module and every module it includes, directly or not, each once,
+	// in the order a depth-first search through the includes reaches them.
+	// Looking names up in it finds what the recursive search would find,
+	// without walking shared includes again for every path to them.
+	const std::vector<const Module*> &lookupOrder() const;
+
 	QString fullpath_;
 	std::vector<std::shared_ptr<const Module>> included_;
+	mutable std::vector<const Module*> lookupOrder_;
 	QList<Struct> structs_;
 	QList<Variable> variables_;
 	QMap<QString, int> structsByName_;

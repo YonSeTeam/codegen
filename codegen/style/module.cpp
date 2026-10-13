@@ -6,6 +6,8 @@
 //
 #include "codegen/style/module.h"
 
+#include <algorithm>
+
 namespace codegen {
 namespace style {
 namespace structure {
@@ -22,6 +24,25 @@ Module::Module(const QString &fullpath) : fullpath_(fullpath) {
 
 void Module::addIncluded(std::shared_ptr<const Module> value) {
 	included_.push_back(std::move(value));
+	lookupOrder_.clear();
+}
+
+const std::vector<const Module*> &Module::lookupOrder() const {
+	if (lookupOrder_.empty()) {
+		lookupOrder_.push_back(this);
+		for (const auto &module : included_) {
+			for (const auto other : module->lookupOrder()) {
+				const auto i = std::find(
+					lookupOrder_.begin(),
+					lookupOrder_.end(),
+					other);
+				if (i == lookupOrder_.end()) {
+					lookupOrder_.push_back(other);
+				}
+			}
+		}
+	}
+	return lookupOrder_;
 }
 
 bool Module::addStruct(const Struct &value) {
@@ -34,12 +55,11 @@ bool Module::addStruct(const Struct &value) {
 }
 
 const Struct *Module::findStruct(const FullName &name) const {
-	if (auto result = findStructInModule(name, *this)) {
-		return result;
-	}
-	for (const auto &module : included_) {
-		if (auto result = module->findStruct(name)) {
-			return result;
+	const auto key = fullNameKey(name);
+	for (const auto module : lookupOrder()) {
+		const auto index = module->structsByName_.value(key, -1);
+		if (index >= 0) {
+			return &module->structs_.at(index);
 		}
 	}
 	return nullptr;
@@ -55,14 +75,12 @@ bool Module::addVariable(const Variable &value) {
 }
 
 const Variable *Module::findVariable(const FullName &name, bool *outFromThisModule) const {
-	if (auto result = findVariableInModule(name, *this)) {
-		if (outFromThisModule) *outFromThisModule = true;
-		return result;
-	}
-	for (const auto &module : included_) {
-		if (auto result = module->findVariable(name)) {
-			if (outFromThisModule) *outFromThisModule = false;
-			return result;
+	const auto key = fullNameKey(name);
+	for (const auto module : lookupOrder()) {
+		const auto index = module->variablesByName_.value(key, -1);
+		if (index >= 0) {
+			if (outFromThisModule) *outFromThisModule = (module == this);
+			return &module->variables_.at(index);
 		}
 	}
 	return nullptr;
